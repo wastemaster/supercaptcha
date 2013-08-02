@@ -1,12 +1,6 @@
-# -*- coding: utf-8 -*-
+# coding: utf-8
 
-import os
-from random import choice, random
-
-try:
-    import Image, ImageDraw, ImageFont, ImageFilter
-except ImportError:
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from django import forms
 from django.core.cache import cache
 from django.core.urlresolvers import reverse
@@ -15,14 +9,20 @@ from django.http import HttpResponse
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy
 from django.views.decorators.cache import never_cache
-
+import os
 import settings
+import random
+import logging
+
+
+logger = logging.getLogger('supercaptcha')
 
 
 try:
     from threading import local
 except ImportError:
     from django.utils._threading_local import local
+
 
 _thread_locals = local()
 
@@ -46,39 +46,53 @@ REFRESH_LINK_TEXT = ugettext_lazy(settings.REFRESH_LINK_TEXT)
 
 
 def get_current_code():
+    logger.debug('call get_current_code()')
     if not hasattr(_thread_locals, CODE_ATTR_NAME):
         code = os.urandom(16).encode('hex')
         setattr(_thread_locals, CODE_ATTR_NAME, code)
+        logger.debug('No code found. Generate it: %s' % code)
     return getattr(_thread_locals, CODE_ATTR_NAME)
 
 
 def set_current_code(value):
     setattr(_thread_locals, CODE_ATTR_NAME, value)
+    logger.debug('call set_current_code("%s")' % value)
 
 
 def empty_current_code():
+    logger.debug('call empty_current_code()')
     if hasattr(_thread_locals, CODE_ATTR_NAME):
+        logger.debug('Code found and cleared')
         delattr(_thread_locals, CODE_ATTR_NAME)
 
 
 def generate_text():
-    return ''.join([choice(SYMBOLS) for _ in range(LENGTH)])
+    text = ''.join([random.choice(SYMBOLS) for _ in range(LENGTH)])
+    logger.debug('call generate_text(): %s' % text)
+    return text
 
 
 @never_cache
 def draw(request, code):
-    
-    font_name, fontfile = choice(settings.AVAIL_FONTS)
+    """
+    Supercaptcha view
+    """
+    logger.debug('Begin of "draw" view ')
+
+    font_name, fontfile = random.choice(settings.AVAIL_FONTS)
+    cache_key = '{prefix}-{code}' % {'prefix': PREFIX, 'code': code}
     cache_name = '%s-%s-size' % (PREFIX, font_name)
     text = generate_text()
-    cache.set('%s-%s' % (PREFIX, code), text, 600)
-    
+
+    cache.set(cache_key, text, 600)
+
     def fits(font_size):
         font = ImageFont.truetype(fontfile, font_size)
         size = font.getsize(text)
         return size[0] < WIDTH and size[1] < HEIGHT
-    
-    font_size = cache.get(cache_name , 10)
+
+
+    font_size = cache.get(cache_name, 10)
     if fits(font_size):
         while True:
             font_size += 1
@@ -90,20 +104,24 @@ def draw(request, code):
             font_size -= 1
             if fits(font_size):
                 break
+
     cache.set(cache_name, font_size, 600)
-    
+
     font = ImageFont.truetype(fontfile, font_size)
     text_size = font.getsize(text)
     icolor = 'RGB'
+
     if len(BG_COLOR) == 4:
         icolor = 'RGBA'
+
     im = Image.new(icolor, (WIDTH, HEIGHT), BG_COLOR)
     d = ImageDraw.Draw(im)
+
     if JUMP:
         if COLORIZE:
-            get_color = lambda: choice(FG_COLORS)
+            get_color = lambda: random.choice(FG_COLORS)
         else:
-            color = choice(FG_COLORS)
+            color = random.choice(FG_COLORS)
             get_color = lambda: color
         position = [(WIDTH - text_size[0]) / 2, 0]
         shift_max = HEIGHT - text_size[1]
@@ -112,7 +130,7 @@ def draw(request, code):
         for char in text:
             l_size = font.getsize(char)
             try:
-                position[1] = choice(range(shift_min, shift_max + 1))
+                position[1] = random.choice(range(shift_min, shift_max + 1))
             except IndexError:
                 position[1] = shift_min
             d.text(position, char, font=font, fill=get_color())
@@ -120,53 +138,65 @@ def draw(request, code):
     else:
         position = [(WIDTH - text_size[0]) / 2,
                     (HEIGHT - text_size[1]) / 2]
-        d.text(position, text, font=font, fill=choice(FG_COLORS))
-    
+        d.text(position, text, font=font, fill=random.choice(FG_COLORS))
+
     response = HttpResponse(mimetype=MIME_TYPE)
-    
     response['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate'
-    
+
     for f in settings.FILTER_CHAIN:
         im = im.filter(getattr(ImageFilter, f))
-    
+
     im.save(response, ENC_TYPE)
+    logger.debug('End of "draw" view ')
     return response
 
+
 class CaptchaImageWidget(forms.Widget):
-    
     if REFRESH:
         template = HTML_TEMPLATE_WITH_REFRESH
     else:
         template = HTML_TEMPLATE
-    
+
     def render(self, name, value, attrs=None):
+        logger.debug('CaptchImageWidget.render() begin')
         code = get_current_code()
         empty_current_code()
         input_attrs = self.build_attrs(attrs, type='text', name=name)
-        src = reverse(draw, kwargs={'code': code})
-        return mark_safe(self.template % {'src': src, 'input_attrs': flatatt(input_attrs),
-                                          'alt': settings.ALT, 'width': WIDTH, 'length': LENGTH,
-                                          'height': HEIGHT, 'rnd': random(),
+        logger.debug('CaptchImageWidget.render() end')
+        return mark_safe(self.template % {'src': reverse(draw, kwargs={'code': code}),
+                                          'input_attrs': flatatt(input_attrs),
+                                          'alt': settings.ALT,
+                                          'width': WIDTH,
+                                          'length': LENGTH,
+                                          'height': HEIGHT,
+                                          'rnd': random.random(),
                                           'refresh_text': REFRESH_LINK_TEXT})
 
+
 class HiddenCodeWidget(forms.HiddenInput):
-	
     def render(self, name, value=None, attrs=None):
+        logger.debug('HiddenCodeWidget.render() begin')
+
         if value is None:
+            logger.debug('  value is None, calling empty_current_code')
             empty_current_code()
+
         if not value:
             value = get_current_code()
+            logger.debug('  value is empty, called get_current_code() and gets %s' % value)
         else:
             set_current_code(value)
+            logger.debug('  sets %s as code' % value)
+
+        logger.debug('HiddenCodeWidget.render() end')
         return super(HiddenCodeWidget, self).render(name, value, attrs=attrs)
 
 
 class CaptchaWidget(forms.MultiWidget):
-    
     def __init__(self, attrs={}, code=None):
         widgets = (HiddenCodeWidget(attrs=attrs), CaptchaImageWidget(attrs=attrs))
         super(CaptchaWidget, self).__init__(widgets, attrs)
-    
+
     def decompress(self, value):
         if value:
             return value.split()
@@ -180,37 +210,48 @@ class CaptchaWidget(forms.MultiWidget):
 
 
 class CaptchaField(forms.MultiValueField):
-    
     widget = CaptchaWidget
 
     default_error_messages = {
         'wrong': ugettext_lazy(ERROR_MESSAGE),
         'required': ugettext_lazy(u'This field is required.'),
         'internal': ugettext_lazy(u'Internal error.'),
-        }
+    }
 
     def __init__(self, *args, **kwargs):
-        fields = (
-            forms.CharField(max_length=32, min_length=32),
-            forms.CharField(max_length=settings.LENGTH, min_length=settings.LENGTH),
-            )
-        super(CaptchaField, self).__init__(fields, *args, **kwargs)
-        
+        super(CaptchaField, self).__init__(
+            (forms.CharField(max_length=32, min_length=32),
+             forms.CharField(max_length=settings.LENGTH, min_length=settings.LENGTH)), *args, **kwargs)
+
     def compress(self, data_list):
         return ' '.join(data_list)
-    
+
     def clean(self, value):
+        """
+        """
+        logger.debug('CaptchaField.clean() begin')
+
         if len(value) != 2:
-            raise forms.ValidationError, self.error_messages['wrong']
-        
+            raise forms.ValidationError(self.error_messages['wrong'])
+
         code, text = value
-        cached_text = cache.get('%s-%s' % (PREFIX, code))
-        cache.set('%s-%s' % (PREFIX, code), generate_text(), 600)
-        
+        cache_key = '{prefix}-{code}' % {'prefix': PREFIX, 'code': code}
+
+        cached_text = cache.get(cache_key)
+
         if not cached_text:
-            raise forms.ValidationError, self.error_messages['internal']
+            cache.set(cache_key, generate_text(), 600)
+
+        if not cached_text:
+            logger.debug('No cached_text found; raises Internal')
+            raise forms.ValidationError(self.error_messages['internal'])
+
         if not text:
-            raise forms.ValidationError, self.error_messages['required']
+            logger.debug('No text found; raises Required')
+            raise forms.ValidationError(self.error_messages['required'])
+
         if text.lower() != cached_text.lower():
-            raise forms.ValidationError, self.error_messages['wrong']
-        
+            logger.debug('Captcha does not match: %s != %s' % (text.lower(), cached_text.lower()))
+            raise forms.ValidationError(self.error_messages['wrong'])
+
+        logger.debug('CaptchaField.clean() end')
